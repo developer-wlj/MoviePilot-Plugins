@@ -1,5 +1,6 @@
 import json
 import re
+import threading
 from collections import defaultdict
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Tuple, Optional
@@ -20,7 +21,7 @@ class AutoAuction(_PluginBase):
     plugin_name = "朱雀交易行自动上架"
     plugin_desc = "自动上架灵石或上传到交易行"
     plugin_icon = "auction.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "no_reply"
     author_url = "https://github.com/jxxghp/MoviePilot-Plugins"
     plugin_config_prefix = "autoauction_"
@@ -36,6 +37,9 @@ class AutoAuction(_PluginBase):
     _notify_enabled: bool = True
     _scheduler: Optional[BackgroundScheduler] = None
     _is_running: bool = False
+    _running_lock: threading.Lock = threading.Lock()
+    _last_run_time: float = 0
+    _min_interval_seconds: int = 60
 
     ZHUQUE_DOMAIN = "zhuque.in"
     LIST_API = "https://zhuque.in/api/transaction/list"
@@ -282,7 +286,10 @@ class AutoAuction(_PluginBase):
                         "name": "拍卖行上架-全局任务",
                         "trigger": CronTrigger.from_crontab(cron),
                         "func": self.run_all_tasks,
-                        "kwargs": {}
+                        "kwargs": {},
+                        "misfire_grace_time": self._min_interval_seconds * 2,
+                        "max_instances": 1,
+                        "coalesce": True
                     })
                 except Exception as e:
                     logger.error(f"全局cron配置错误: {str(e)}")
@@ -453,11 +460,25 @@ class AutoAuction(_PluginBase):
             return {"success": False, "message": f"上架异常: {str(e)}"}
 
     def run_all_tasks(self) -> Dict[str, Any]:
-        if self._is_running:
-            logger.warn("上架任务正在执行中，跳过本次调用")
-            return {"success": False, "message": "任务正在执行中"}
-        
-        self._is_running = True
+        tz = pytz.timezone(settings.TZ)
+        now = datetime.now(tz=tz)
+        current_time = now.timestamp()
+
+        with self._running_lock:
+            if self._is_running:
+                logger.warn("上架任务正在执行中，跳过本次调用")
+                return {"success": False, "message": "任务正在执行中"}
+            if current_time - self._last_run_time < self._min_interval_seconds:
+                logger.warn(f"上架任务执行间隔太短({self._min_interval_seconds}秒)，跳过本次调用")
+                return {"success": False, "message": f"执行间隔太短，请等待{self._min_interval_seconds}秒"}
+            today = now.strftime('%Y-%m-%d')
+            last_run_date = self.get_data("last_run_date") or ""
+            if last_run_date == today:
+                logger.warn(f"今日({today})已执行过上架任务，跳过本次调用")
+                return {"success": False, "message": f"今日({today})已执行过上架任务"}
+            self._is_running = True
+            self._last_run_time = current_time
+
         try:
             logger.info(f"开始执行上架任务，共 {len(self._tasks)} 个配置")
             results = []
@@ -473,7 +494,7 @@ class AutoAuction(_PluginBase):
 
                 if result.get("success"):
                     transaction_id = result.get("data", {}).get("transactionId")
-                    record_time = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d %H:%M:%S")
+                    record_time = now.strftime("%Y-%m-%d %H:%M:%S")
                     self._history.insert(0, {
                         "upload": task.get("upload"),
                         "bonus": task.get("bonus"),
@@ -494,11 +515,12 @@ class AutoAuction(_PluginBase):
             if self._history:
                 self.save_data("history", self._history)
 
+            self.save_data("last_run_date", today)
+
             if self._notify_enabled and success_records:
                 try:
                     type_text = "出售上传" if self._tasks[0].get("type", 2) == 2 else "出售灵石" if self._tasks[0].get("type", 2) == 1 else ""
-                    summary_date = datetime.now(tz=pytz.timezone(settings.TZ)).strftime("%Y-%m-%d")
-                    text_lines = [f"{summary_date}  {type_text}"]
+                    text_lines = [f"{today}  {type_text}"]
                     for record in success_records:
                         text_lines.append(record)
                     text = "\n".join(text_lines)
